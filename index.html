@@ -1,0 +1,389 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from 'firebase/auth';
+import { getFirestore, doc, setDoc, onSnapshot, collection, increment, serverTimestamp, query, limit } from 'firebase/firestore';
+import { MousePointer2, Settings, X, Timer, Users, Eye, Globe, Save, CheckCircle2, ExternalLink, Loader2, Wallet, Trophy, ChevronRight, AlertCircle } from 'lucide-react';
+
+// --- INITIAL CONFIG ---
+const firebaseConfig = JSON.parse(__firebase_config);
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'robux-ultra-final';
+
+export default function App() {
+  const [user, setUser] = useState(null);
+  const [clicks, setClicks] = useState(0);
+  const [allPlayers, setAllPlayers] = useState([]);
+  const [onlineCount, setOnlineCount] = useState(1);
+  const [loading, setLoading] = useState(true);
+  const [showAdmin, setShowAdmin] = useState(false);
+  const [adminTab, setAdminTab] = useState('config'); // 'config' | 'players'
+  const [saveStatus, setSaveStatus] = useState(false);
+  const [adLoading, setAdLoading] = useState(true);
+  
+  // Withdraw State
+  const [withdrawAmount, setWithdrawAmount] = useState('');
+  const [withdrawStatus, setWithdrawStatus] = useState(null);
+
+  // Ad State
+  const [showInterstitial, setShowInterstitial] = useState(false);
+  const [adTimer, setAdTimer] = useState(0);
+  const [nextAdIn, setNextAdIn] = useState(15);
+
+  // Editable Config
+  const [config, setConfig] = useState({ 
+    adsEnabled: true, 
+    adIntervalSeconds: 20,
+    adDuration: 5,
+    adUrl: "https://www.wikipedia.org",
+    minWithdraw: 500,
+    clickValue: 0.01 // 1000 кликов = 10 Robux (10 / 1000 = 0.01)
+  });
+
+  const [tempUrl, setTempUrl] = useState(config.adUrl);
+
+  // 1. Auth & Presence
+  useEffect(() => {
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (err) { console.error("Auth failed:", err); }
+    };
+    initAuth();
+    
+    const unsubscribe = onAuthStateChanged(auth, (u) => {
+      setUser(u);
+      if (u) {
+        // Обновляем статус онлайн и записываем ID в общую базу игроков
+        const playerRef = doc(db, 'artifacts', appId, 'public', 'data', 'players', u.uid);
+        setDoc(playerRef, { 
+            uid: u.uid, 
+            lastSeen: serverTimestamp() 
+        }, { merge: true });
+      }
+    });
+    return () => unsubscribe();
+  }, []);
+
+  // 2. Real-time Config & Online Users
+  useEffect(() => {
+    if (!user) return;
+    
+    // Подписка на конфиг
+    const configRef = doc(db, 'artifacts', appId, 'public', 'data', 'settings', 'config');
+    const unsubConfig = onSnapshot(configRef, (snap) => {
+      if (snap.exists()) {
+        const data = snap.data();
+        setConfig(prev => ({ ...prev, ...data }));
+        setTempUrl(data.adUrl || prev.adUrl);
+      }
+    });
+
+    // Подписка на список всех игроков (для Админки)
+    const playersRef = collection(db, 'artifacts', appId, 'public', 'data', 'players');
+    const unsubPlayers = onSnapshot(playersRef, (snap) => {
+      const players = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setAllPlayers(players);
+      setOnlineCount(snap.size);
+    });
+
+    return () => { unsubConfig(); unsubPlayers(); };
+  }, [user]);
+
+  // 3. User Stats Sync
+  useEffect(() => {
+    if (!user) return;
+    const userDocRef = doc(db, 'artifacts', appId, 'users', user.uid, 'stats', 'game_data');
+    const unsubscribe = onSnapshot(userDocRef, (snap) => {
+      if (snap.exists()) {
+        const currentClicks = Number(snap.data().clicks) || 0;
+        setClicks(currentClicks);
+        // Дублируем баланс в публичную часть для админки
+        const publicRef = doc(db, 'artifacts', appId, 'public', 'data', 'players', user.uid);
+        setDoc(publicRef, { clicks: currentClicks, lastSeen: serverTimestamp() }, { merge: true });
+      }
+      setLoading(false);
+    }, () => setLoading(false));
+    return () => unsubscribe();
+  }, [user]);
+
+  // 4. Advertising Logic
+  useEffect(() => {
+    if (!config.adsEnabled || showInterstitial) return;
+
+    const timer = setInterval(() => {
+      setNextAdIn(prev => {
+        if (prev <= 1) {
+          triggerInterstitial();
+          return config.adIntervalSeconds;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+
+    return () => clearInterval(timer);
+  }, [config.adsEnabled, config.adIntervalSeconds, showInterstitial]);
+
+  // 5. Ad Close Countdown
+  useEffect(() => {
+    let interval;
+    if (showInterstitial && adTimer > 0) {
+      interval = setInterval(() => setAdTimer(prev => prev - 1), 1000);
+    }
+    return () => clearInterval(interval);
+  }, [showInterstitial, adTimer]);
+
+  const triggerInterstitial = () => {
+    setAdLoading(true);
+    setAdTimer(config.adDuration);
+    setShowInterstitial(true);
+  };
+
+  const handleClick = async () => {
+    if (!user || showInterstitial) return;
+    
+    setClicks(prev => prev + config.clickValue);
+    const userDocRef = doc(db, 'artifacts', appId, 'users', user.uid, 'stats', 'game_data');
+    try {
+      await setDoc(userDocRef, { clicks: increment(config.clickValue) }, { merge: true });
+    } catch (e) { console.error(e); }
+  };
+
+  const updateRemoteConfig = async (updates) => {
+    const configRef = doc(db, 'artifacts', appId, 'public', 'data', 'settings', 'config');
+    await setDoc(configRef, updates, { merge: true });
+    setSaveStatus(true);
+    setTimeout(() => setSaveStatus(false), 2000);
+  };
+
+  const handleWithdraw = () => {
+    if (clicks < config.minWithdraw) {
+        setWithdrawStatus(`Минимум для вывода: ${config.minWithdraw} R$`);
+    } else {
+        setWithdrawStatus("Заявка отправлена! Ожидайте проверки модератором.");
+    }
+    setTimeout(() => setWithdrawStatus(null), 5000);
+  };
+
+  if (loading) return <div className="h-screen flex items-center justify-center bg-[#0a0a0a] text-amber-500 font-black tracking-widest animate-pulse">СИНХРОНИЗАЦИЯ...</div>;
+
+  return (
+    <div className="min-h-screen bg-[#050505] text-white flex flex-col font-sans select-none overflow-hidden">
+      
+      {/* AD OVERLAY */}
+      {showInterstitial && (
+        <div className="fixed inset-0 z-[500] bg-black flex flex-col">
+          <div className="bg-zinc-900 p-4 flex justify-between items-center border-b border-white/5">
+             <div className="flex items-center gap-3">
+                <div className="w-8 h-8 bg-amber-500 rounded flex items-center justify-center text-black font-black">R</div>
+                <div className="text-xs font-bold text-zinc-400 uppercase tracking-tighter">Спонсорская реклама</div>
+             </div>
+             <div className="flex items-center gap-2">
+                <a href={config.adUrl} target="_blank" rel="noopener noreferrer" className="bg-white/10 hover:bg-white/20 px-4 py-2 rounded-lg text-xs font-bold flex items-center gap-2">
+                  САЙТ <ExternalLink size={14} />
+                </a>
+                {adTimer > 0 ? (
+                  <div className="bg-zinc-800 text-zinc-400 px-4 py-2 rounded-lg text-xs font-black">ЖДИТЕ {adTimer}с</div>
+                ) : (
+                  <button onClick={() => setShowInterstitial(false)} className="bg-blue-600 hover:bg-blue-500 text-white px-6 py-2 rounded-lg text-xs font-black flex items-center gap-2">
+                    ПРОПУСТИТЬ <X size={14} />
+                  </button>
+                )}
+             </div>
+          </div>
+          <div className="flex-1 relative bg-zinc-950">
+            {adLoading && <div className="absolute inset-0 flex flex-col items-center justify-center gap-4 text-zinc-700"><Loader2 className="animate-spin" size={32} /><p className="text-[10px] uppercase font-black">Загрузка...</p></div>}
+            <iframe src={config.adUrl} className={`w-full h-full border-none transition-opacity duration-500 ${adLoading ? 'opacity-0' : 'opacity-100'}`} onLoad={() => setAdLoading(false)} />
+          </div>
+        </div>
+      )}
+
+      {/* TOP NAV */}
+      <nav className="p-4 flex justify-between items-center bg-black/50 border-b border-white/5">
+        <div className="flex items-center gap-3">
+          <div className="bg-amber-500 p-2 rounded-xl text-black shadow-lg shadow-amber-500/20"><MousePointer2 size={18} /></div>
+          <div><div className="text-[9px] font-black text-amber-500/50 uppercase tracking-[0.2em]">Robux Clicker</div><div className="text-xs font-black italic">ULTRA EDITION</div></div>
+        </div>
+        <div className="flex items-center gap-2">
+          <div className="bg-zinc-900 px-3 py-1.5 rounded-full flex items-center gap-2 border border-white/5">
+            <div className="w-1.5 h-1.5 bg-green-500 rounded-full animate-pulse" />
+            <span className="text-[10px] font-black text-zinc-400 uppercase">{onlineCount} ОНЛАЙН</span>
+          </div>
+          <button onClick={() => setShowAdmin(true)} className="p-2 hover:bg-white/5 rounded-lg text-zinc-500"><Settings size={18} /></button>
+        </div>
+      </nav>
+
+      {/* GAME AREA */}
+      <main className="flex-1 flex flex-col items-center justify-center p-6 space-y-12">
+        {/* Counter */}
+        <div className="text-center group">
+            <div className="text-zinc-600 text-[10px] font-black uppercase tracking-[0.4em] mb-4">ВАШИ НАКОПЛЕНИЯ</div>
+            <div className="relative inline-block">
+                <div className="flex items-baseline justify-center gap-2">
+                    <span className="text-8xl font-black tracking-tighter tabular-nums drop-shadow-[0_0_30px_rgba(245,158,11,0.2)]">
+                        {clicks.toFixed(2)}
+                    </span>
+                    <span className="text-3xl font-black text-amber-500 italic drop-shadow-md">R$</span>
+                </div>
+                {/* Visual conversion info */}
+                <div className="mt-2 text-[9px] font-bold text-zinc-700 bg-white/5 py-1 px-3 rounded-full inline-block">
+                    КУРС: 1000 КЛИКОВ = 10 R$
+                </div>
+            </div>
+        </div>
+
+        {/* CLICKER BUTTON */}
+        <button 
+            onClick={handleClick}
+            disabled={showInterstitial}
+            className="relative w-72 h-72 active:scale-95 transition-all duration-75 outline-none"
+        >
+            <div className="absolute inset-0 bg-amber-500/10 blur-[100px] rounded-full animate-pulse" />
+            <div className="relative w-full h-full bg-zinc-900 border-[16px] border-zinc-800 rounded-full flex items-center justify-center shadow-[0_0_50px_rgba(0,0,0,0.5)] overflow-hidden">
+                <div className="absolute inset-0 bg-gradient-to-br from-white/5 to-transparent" />
+                <span className="text-[140px] font-black text-amber-500 select-none drop-shadow-2xl italic">R</span>
+            </div>
+        </button>
+
+        {/* WITHDRAW SECTION */}
+        <div className="w-full max-w-sm space-y-4">
+            <div className="bg-zinc-900/50 border border-white/5 rounded-3xl p-5 flex items-center justify-between">
+                <div className="flex items-center gap-4">
+                    <div className="w-12 h-12 bg-blue-500/10 rounded-2xl flex items-center justify-center text-blue-500 border border-blue-500/20">
+                        <Wallet size={24} />
+                    </div>
+                    <div>
+                        <div className="text-[10px] font-black text-zinc-500 uppercase">Минимальный вывод</div>
+                        <div className="text-lg font-black">{config.minWithdraw} Robux</div>
+                    </div>
+                </div>
+                <button 
+                    onClick={handleWithdraw}
+                    className={`px-6 py-3 rounded-2xl font-black text-xs uppercase transition-all ${clicks >= config.minWithdraw ? 'bg-blue-600 hover:bg-blue-500 text-white shadow-lg shadow-blue-600/30' : 'bg-zinc-800 text-zinc-600 cursor-not-allowed'}`}
+                >
+                    Вывести
+                </button>
+            </div>
+            
+            {withdrawStatus && (
+                <div className="bg-blue-500 text-white p-3 rounded-xl text-center text-[10px] font-black uppercase animate-bounce">
+                   {withdrawStatus}
+                </div>
+            )}
+            
+            {/* Progress Bar to Ad */}
+            <div className="space-y-2 pt-4">
+                <div className="flex justify-between text-[9px] font-black text-zinc-600 uppercase tracking-widest">
+                    <span>Следующая реклама через</span>
+                    <span>{nextAdIn} секунд</span>
+                </div>
+                <div className="h-1 bg-zinc-900 rounded-full overflow-hidden">
+                    <div className="h-full bg-amber-500/50 transition-all duration-1000 ease-linear" style={{ width: `${(nextAdIn / config.adIntervalSeconds) * 100}%` }} />
+                </div>
+            </div>
+        </div>
+      </main>
+
+      {/* ADMIN PANEL */}
+      {showAdmin && (
+        <div className="fixed inset-0 z-[600] flex items-center justify-center p-4">
+          <div className="absolute inset-0 bg-black/95 backdrop-blur-md" onClick={() => setShowAdmin(false)}></div>
+          <div className="relative bg-[#0f0f0f] w-full max-w-lg h-[80vh] rounded-[3rem] border border-white/10 shadow-2xl overflow-hidden flex flex-col">
+            
+            {/* Admin Header */}
+            <div className="p-6 border-b border-white/5 flex justify-between items-center bg-black/20">
+                <div className="flex gap-4">
+                    <button 
+                        onClick={() => setAdminTab('config')} 
+                        className={`text-xs font-black uppercase tracking-widest px-4 py-2 rounded-xl transition-all ${adminTab === 'config' ? 'bg-amber-500 text-black' : 'text-zinc-500 hover:text-white'}`}
+                    >Настройки</button>
+                    <button 
+                        onClick={() => setAdminTab('players')} 
+                        className={`text-xs font-black uppercase tracking-widest px-4 py-2 rounded-xl transition-all ${adminTab === 'players' ? 'bg-amber-500 text-black' : 'text-zinc-500 hover:text-white'}`}
+                    >Игроки ({allPlayers.length})</button>
+                </div>
+                <button onClick={() => setShowAdmin(false)} className="p-2 hover:bg-white/5 rounded-full text-zinc-500"><X /></button>
+            </div>
+
+            <div className="flex-1 overflow-y-auto p-6">
+                {adminTab === 'config' ? (
+                    <div className="space-y-8">
+                        <div className="space-y-4">
+                            <label className="text-[10px] font-black text-zinc-500 uppercase flex items-center gap-2"><Globe size={14}/> Рекламная ссылка (URL)</label>
+                            <div className="flex gap-2">
+                                <input type="text" value={tempUrl} onChange={(e) => setTempUrl(e.target.value)} placeholder="https://..." className="flex-1 bg-black border border-white/10 rounded-2xl p-4 text-xs font-medium focus:border-amber-500/50 outline-none" />
+                                <button onClick={() => updateRemoteConfig({ adUrl: tempUrl })} className="bg-amber-500 text-black px-6 rounded-2xl font-black text-xs hover:bg-amber-400 transition-colors">
+                                    {saveStatus ? <CheckCircle2 size={20} /> : <Save size={20} />}
+                                </button>
+                            </div>
+                        </div>
+
+                        <div className="grid grid-cols-2 gap-4">
+                            <div className="space-y-4">
+                                <label className="text-[10px] font-black text-zinc-500 uppercase px-1">Интервал рекламы (сек)</label>
+                                <input 
+                                    type="number" 
+                                    value={config.adIntervalSeconds} 
+                                    onChange={(e) => updateRemoteConfig({ adIntervalSeconds: Number(e.target.value) })}
+                                    className="w-full bg-black border border-white/10 rounded-2xl p-4 text-xs font-black"
+                                />
+                            </div>
+                            <div className="space-y-4">
+                                <label className="text-[10px] font-black text-zinc-500 uppercase px-1">Минимум для вывода</label>
+                                <input 
+                                    type="number" 
+                                    value={config.minWithdraw} 
+                                    onChange={(e) => updateRemoteConfig({ minWithdraw: Number(e.target.value) })}
+                                    className="w-full bg-black border border-white/10 rounded-2xl p-4 text-xs font-black"
+                                />
+                            </div>
+                        </div>
+
+                        <div className="bg-amber-500/5 border border-amber-500/10 p-4 rounded-3xl flex items-center gap-4">
+                            <div className="w-10 h-10 bg-amber-500/10 rounded-xl flex items-center justify-center text-amber-500"><AlertCircle size={20}/></div>
+                            <div className="text-[10px] font-medium text-zinc-400">
+                                Текущий курс: <span className="text-amber-500 font-black">1000 кликов = 10 Robux</span>. 
+                                Это значение (0.01 за клик) вшито в код для стабильности.
+                            </div>
+                        </div>
+                    </div>
+                ) : (
+                    <div className="space-y-3">
+                        {allPlayers.sort((a,b) => (b.clicks || 0) - (a.clicks || 0)).map((player, idx) => (
+                            <div key={player.id} className="bg-black/40 border border-white/5 p-4 rounded-2xl flex items-center justify-between group hover:border-amber-500/20 transition-all">
+                                <div className="flex items-center gap-4">
+                                    <div className={`w-8 h-8 rounded-lg flex items-center justify-center font-black text-xs ${idx === 0 ? 'bg-amber-500 text-black' : 'bg-zinc-800 text-zinc-500'}`}>
+                                        {idx + 1}
+                                    </div>
+                                    <div>
+                                        <div className="text-[10px] font-black text-zinc-500 mb-0.5 uppercase truncate w-32">ID: {player.id}</div>
+                                        <div className="text-xs font-bold text-zinc-400 flex items-center gap-1.5">
+                                            <div className={`w-1.5 h-1.5 rounded-full ${Date.now() - (player.lastSeen?.seconds * 1000 || 0) < 60000 ? 'bg-green-500' : 'bg-zinc-700'}`} />
+                                            {Date.now() - (player.lastSeen?.seconds * 1000 || 0) < 60000 ? 'СЕЙЧАС В ИГРЕ' : 'ОФФЛАЙН'}
+                                        </div>
+                                    </div>
+                                </div>
+                                <div className="text-right">
+                                    <div className="text-sm font-black text-amber-500">{(player.clicks || 0).toFixed(2)} R$</div>
+                                    <div className="text-[9px] font-black text-zinc-600 uppercase tracking-tighter">Всего кликов: {Math.round((player.clicks || 0) / 0.01)}</div>
+                                </div>
+                            </div>
+                        ))}
+                    </div>
+                )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      <footer className="p-6 text-center text-[9px] font-black text-zinc-800 uppercase tracking-[0.6em]">
+        Server Instance: GLOBAL-PRODUCTION-EU
+      </footer>
+    </div>
+  );
+}
